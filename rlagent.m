@@ -1,40 +1,44 @@
-%% train_rl_2D.m
+%% rlagent.m — SAC Training Script for pmsm_with_fuel_cell
+clear; clc;
+
 % 1. System Sample Times
 Ts  = 2e-6;   % Physical Simscape solver step (2 microseconds)
 Tsc = 0.05;   % RL Agent sample time (50 ms = 20 Hz control loop)
 
-% PMSM Parameters 
+% 2. PMSM Parameters (Used by PMSM and PMSM Field-Oriented Control masks)
 PM = 0.03; Ld = 2e-4; Lq = 2e-4; L0 = 2e-4; Rs = 0.013; N = 6; J = 0.2;
 Imax = 100; Tmax = 1.5*N*PM*Imax; fnom = 100;
 rpm_nom = 60*fnom/N; omegam_nom = 2*pi*fnom/N; Pmax = omegam_nom*Tmax;
 
-%% 2. Open Simulink Model
+% Default 30s RPM reference so the model compiles cleanly before ResetFcn runs
+t_init = (0:Tsc:30)';
+speed_reference = timeseries(180 * ones(size(t_init)), t_init);
+
+%% 3. Open Simulink Model
 modelName = 'pmsm_with_fuel_cell';
 open_system(modelName);
 
-%% 3. Observation Spec — 11 Signals (Added 2nd Action Feedback)
+%% 4. Observation Spec — 11 Signals
 numObs = 11;
 obsInfo = rlNumericSpec([numObs 1], ...
     'LowerLimit', -inf*ones(numObs,1), ...
     'UpperLimit',  inf*ones(numObs,1));
 obsInfo.Name = 'observations';
 
-%% 4. Action Spec — 2D Action Space
-% Action 1: Duty cycle shift [-0.05, 0.05]
-% Action 2: Bus voltage setpoint delta [-5V, +5V]
-numAct = 2;
+%% 5. Action Spec — 1D Incremental Duty Cycle Shift [-0.05, 0.05]
+numAct = 1;
 actInfo = rlNumericSpec([numAct 1], ...
-    'LowerLimit', [-0.05; 300], ...
-    'UpperLimit',  [ 0.05;  500]);
+    'LowerLimit', -0.05, ...
+    'UpperLimit',  0.05);
 actInfo.Name = 'actions';
 
-%% 5. Create Simulink Environment
+%% 6. Create Simulink Environment
 env = rlSimulinkEnv(modelName, ...
     [modelName '/RL Agent'], ...
     obsInfo, actInfo);
 env.ResetFcn = @myResetFunction;
 
-%% 6. Critic Networks (Double Q-Functions for SAC)
+%% 7. Critic Networks (Double Q-Functions for SAC)
 createCritic = @() ...
     layerGraph([
         featureInputLayer(numObs, 'Name', 'obs')
@@ -55,18 +59,13 @@ createCritic = @() ...
     .connectLayers('obs_relu1', 'concat/in1') ...
     .connectLayers('act_relu1', 'concat/in2');
 
-% Initialize two Q-Value representations
-criticNet1 = createCritic();
-criticNet2 = createCritic();
-
-critic1 = rlQValueFunction(criticNet1, obsInfo, actInfo, ...
+critic1 = rlQValueFunction(createCritic(), obsInfo, actInfo, ...
     'ObservationInputNames', 'obs', 'ActionInputNames', 'act');
-critic2 = rlQValueFunction(criticNet2, obsInfo, actInfo, ...
+critic2 = rlQValueFunction(createCritic(), obsInfo, actInfo, ...
     'ObservationInputNames', 'obs', 'ActionInputNames', 'act');
-
 critics = [critic1, critic2];
 
-%% 7. Actor Network — 2D Gaussian Outputs (Mean and Std)
+%% 8. Actor Network — Gaussian Policy (Mean and Std)
 commonActorPath = [
     featureInputLayer(numObs, 'Name', 'obs')
     fullyConnectedLayer(64, 'Name', 'fc1')
@@ -89,20 +88,24 @@ actor = rlContinuousGaussianActor(actorNetwork, obsInfo, actInfo, ...
     'ActionMeanOutputNames',              'mean', ...
     'ActionStandardDeviationOutputNames', 'std');
 
-%% 8. SAC Agent Options
+%% 9. SAC Agent Options
 agentOpts = rlSACAgentOptions(...
     'SampleTime',                Tsc, ...
     'TargetSmoothFactor',        1e-3, ...
     'ExperienceBufferLength',    1e6, ...
     'MiniBatchSize',             256, ...
-    'NumWarmStartSteps',         1000);
+    'NumWarmStartSteps',         256);
 
 agent = rlSACAgent(actor, critics, agentOpts);
 
-%% 9. Training Options
+%% 10. Training Options
+if ~exist('saved_agents', 'dir')
+    mkdir('saved_agents');
+end
+
 trainOpts = rlTrainingOptions(...
     'MaxEpisodes',                1000, ...
-    'MaxStepsPerEpisode',         600, ...  % 600 steps * 0.05s = 30 seconds per episode
+    'MaxStepsPerEpisode',         600, ...  % 600 steps * 0.05s = 30s per episode
     'ScoreAveragingWindowLength', 20, ...
     'StopTrainingCriteria',       'AverageReward', ...
     'StopTrainingValue',          -100, ...
@@ -112,8 +115,6 @@ trainOpts = rlTrainingOptions(...
     'SaveAgentValue',             -500, ...
     'SaveAgentDirectory',         'saved_agents');
 
-%% 10. Train
+%% 11. Train & Save
 trainingStats = train(agent, env, trainOpts);
-
-%% 11. Save Final Agent
 save('trained_fc_2D_agent.mat', 'agent', 'trainingStats');
